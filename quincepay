@@ -1,0 +1,202 @@
+package.json
+{
+  "name": "quincepay",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@stripe/stripe-js": "^1.59.0",
+    "stripe": "^12.0.0",
+    "supabase-js": "^2.5.0",
+    "next": "14.0.0",
+    "react": "18.0.0",
+    "react-dom": "18.0.0"
+  }
+}
+next.config.js
+
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  reactStrictMode: true,
+  swcMinify: true
+}
+
+module.exports = nextConfig
+
+src/lib/supabase.ts
+
+import { createClient } from "@supabase/supabase-js";
+
+export const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+);
+src/lib/stripe.ts
+
+import Stripe from "stripe";
+
+export const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: "2026-08-01"
+});
+ src/pages/index.tsx
+
+import Link from "next/link";
+
+export default function Home() {
+  return (
+    <main style={{ padding: 40 }}>
+      <h1>Welcome to QuincePay</h1>
+      <Link href="/login">
+        <button>Login / Register</button>
+      </Link>
+    </main>
+  );
+}
+src/pages/login.tsx
+
+import { useState } from "react";
+import { supabase } from "../lib/supabase";
+import { useRouter } from "next/router";
+
+export default function Login() {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const router = useRouter();
+
+  async function handleLogin() {
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    if (!error) router.push("/dashboard");
+  }
+
+  async function handleSignUp() {
+    const { error } = await supabase.auth.signUp({ email, password });
+    if (!error) router.push("/dashboard");
+  }
+
+  return (
+    <main style={{ padding: 40 }}>
+      <h1>Login / Register</h1>
+      <input placeholder="Email" onChange={(e) => setEmail(e.target.value)} />
+      <input type="password" placeholder="Password" onChange={(e) => setPassword(e.target.value)} />
+      <button onClick={handleLogin}>Login</button>
+      <button onClick={handleSignUp}>Register</button>
+    </main>
+  );
+}
+src/pages/dashboard.tsx
+
+import { useEffect, useState } from "react";
+import { supabase } from "../lib/supabase";
+import { loadStripe } from "@stripe/stripe-js";
+
+export default function Dashboard() {
+  const [user, setUser] = useState<any>(null);
+  const [accounts, setAccounts] = useState<any[]>([]);
+  const [balance, setBalance] = useState(0);
+
+  useEffect(() => {
+    const sessionUser = supabase.auth.getSession();
+    sessionUser.then(({ data }) => {
+      if (data.session) setUser(data.session.user);
+    });
+    fetch("/api/get-balance")
+      .then((r) => r.json())
+      .then((d) => setBalance(d.balance || 0));
+    fetch("/api/get-accounts")
+      .then((r) => r.json())
+      .then((d) => setAccounts(d || []));
+  }, []);
+
+  const handleConnectBank = async () => {
+    const { client_secret } = await (await fetch("/api/create-link-session")).json();
+    const stripe = await loadStripe(process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY!);
+    if (stripe)
+      stripe.collectFinancialConnectionsAccounts({ clientSecret: client_secret });
+  };
+
+  const handlePayout = async () => {
+    const res = await fetch("/api/create-payout", {
+      method: "POST",
+      body: JSON.stringify({ userId: user.id, amount: balance })
+    });
+    const data = await res.json();
+    alert("Payout started");
+  };
+
+  return (
+    <main style={{ padding: 40 }}>
+      <h1>QuincePay Dashboard</h1>
+      <p>Balance: ${balance}</p>
+      <button onClick={handleConnectBank}>Connect Bank</button>
+      <button onClick={handlePayout}>Withdraw</button>
+
+      <h2>Connected Accounts</h2>
+      {accounts.map((a) => (
+        <div key={a.id}>{a.bank_name} ****{a.last4}</div>
+      ))}
+    </main>
+  );
+}
+src/pages/api/create-link-session.ts
+
+import type { NextApiRequest, NextApiResponse } from "next";
+import { stripe } from "../../lib/stripe";
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  const session = await stripe.financialConnections.sessions.create({
+    permissions: ["payment_method", "balances"],
+  });
+  res.status(200).json({ client_secret: session.client_secret });
+}
+src/pages/api/get-accounts.ts
+
+import type { NextApiRequest, NextApiResponse } from "next";
+import { supabase } from "../../lib/supabase";
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  const { data: accounts } = await supabase.from("bank_accounts").select("*");
+  res.status(200).json(accounts);
+}
+src/pages/api/create-payout.ts
+
+import type { NextApiRequest, NextApiResponse } from "next";
+import { supabase } from "../../lib/supabase";
+import { stripe } from "../../lib/stripe";
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  const { userId, amount } = JSON.parse(req.body);
+  const { data } = await supabase.from("users").select("stripe_account_id").eq("id", userId).single();
+
+  if (!data?.stripe_account_id) {
+    return res.status(400).json({ error: "No connected account" });
+  }
+
+  const payout = await stripe.payouts.create({
+    amount: Math.floor(amount * 100),
+    currency: "usd",
+    destination: data.stripe_account_id,
+  });
+
+  await supabase.from("transactions").insert({
+    user_id: userId,
+    amount,
+    status: "pending"
+  });
+
+  res.status(200).json({ payoutId: payout.id });
+}
+src/pages/api/get-balance.ts
+
+import type { NextApiRequest, NextApiResponse } from "next";
+import { supabase } from "../../lib/supabase";
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  const { data } = await supabase.from("transactions").select("amount");
+  const balance = data?.reduce((sum: any, t: any) => sum + parseFloat(t.amount), 0) || 0;
+  res.status(200).json({ balance });
+}
